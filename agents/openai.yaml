@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Push Scheduler"
+  short_description: "Schedule staggered pushes for local git commits"
+  default_prompt: "Use $git-push-scheduler to audit pending commit metadata, show a staggered push schedule, and execute it only after approval."
