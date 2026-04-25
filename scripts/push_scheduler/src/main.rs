@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,7 @@ fn run() -> AppResult<()> {
             write_plan_file(&plan)?;
         }
         Mode::Execute(args) => execute_plan(args)?,
+        Mode::Script(args) => render_script(args)?,
     }
     Ok(())
 }
@@ -37,6 +39,7 @@ fn run() -> AppResult<()> {
 enum Mode {
     Plan(PlanArgs),
     Execute(ExecuteArgs),
+    Script(ScriptArgs),
 }
 
 struct PlanArgs {
@@ -50,6 +53,18 @@ struct PlanArgs {
 struct ExecuteArgs {
     plan_file: PathBuf,
     yes: bool,
+}
+
+struct ScriptArgs {
+    plan_file: PathBuf,
+    shell: ScriptShell,
+    output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum ScriptShell {
+    Bash,
+    PowerShell,
 }
 
 #[derive(Clone)]
@@ -106,6 +121,7 @@ fn parse_cli(args: Vec<String>) -> AppResult<Mode> {
     match args[1].as_str() {
         "plan" => parse_plan_args(&args[2..]).map(Mode::Plan),
         "execute" => parse_execute_args(&args[2..]).map(Mode::Execute),
+        "script" => parse_script_args(&args[2..]).map(Mode::Script),
         "--help" | "-h" | "help" => Err(usage()),
         other => Err(format!("unknown subcommand '{other}'\n\n{}", usage())),
     }
@@ -181,9 +197,57 @@ fn parse_execute_args(args: &[String]) -> AppResult<ExecuteArgs> {
     Ok(ExecuteArgs { plan_file, yes })
 }
 
+fn parse_script_args(args: &[String]) -> AppResult<ScriptArgs> {
+    let mut plan_file = PathBuf::from(DEFAULT_PLAN_FILE);
+    let mut shell = ScriptShell::Bash;
+    let mut output = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--plan-file" => {
+                index += 1;
+                plan_file = PathBuf::from(args.get(index).ok_or("--plan-file requires a path")?);
+            }
+            "--shell" => {
+                index += 1;
+                shell = parse_shell(args.get(index))?;
+            }
+            "--output" => {
+                index += 1;
+                output = Some(PathBuf::from(args.get(index).ok_or("--output requires a path")?));
+            }
+            "--help" | "-h" => return Err(usage()),
+            other => return Err(format!("unknown script option '{other}'\n\n{}", usage())),
+        }
+        index += 1;
+    }
+
+    Ok(ScriptArgs {
+        plan_file,
+        shell,
+        output,
+    })
+}
+
+fn parse_shell(value: Option<&String>) -> AppResult<ScriptShell> {
+    match value
+        .ok_or("--shell requires a value: bash or powershell")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "bash" | "sh" => Ok(ScriptShell::Bash),
+        "powershell" | "pwsh" | "ps1" => Ok(ScriptShell::PowerShell),
+        other => Err(format!(
+            "unsupported shell '{other}'; expected bash or powershell"
+        )),
+    }
+}
+
 fn usage() -> String {
     format!(
         "push_scheduler plan [--repo PATH] [--plan-file PATH] [--min-delay-minutes N] [--max-delay-minutes N] [--seed N]\n\
+         push_scheduler script [--plan-file PATH] [--shell bash|powershell] [--output PATH]\n\
          push_scheduler execute [--plan-file PATH] --yes\n\n\
          Defaults:\n\
            plan file: {DEFAULT_PLAN_FILE}\n\
@@ -378,6 +442,33 @@ fn execute_plan(args: ExecuteArgs) -> AppResult<()> {
                 .unwrap_or_default()
         )
     );
+    Ok(())
+}
+
+fn render_script(args: ScriptArgs) -> AppResult<()> {
+    let plan = read_plan_file(&args.plan_file)?;
+    let script = match args.shell {
+        ScriptShell::Bash => render_bash_script(&plan)?,
+        ScriptShell::PowerShell => render_powershell_script(&plan)?,
+    };
+
+    if let Some(output_path) = args.output {
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed to create script output directory '{}': {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::write(&output_path, script).map_err(|error| {
+            format!("failed to write generated script '{}': {error}", output_path.display())
+        })?;
+        println!("Saved script to {}", output_path.display());
+    } else {
+        print!("{script}");
+    }
+
     Ok(())
 }
 
@@ -841,6 +932,145 @@ fn print_plan_summary(plan: &Plan) {
         .map(|commit| commit.cumulative_seconds)
         .unwrap_or_default();
     println!("Total runtime: {}", format_duration(total_seconds));
+    println!(
+        "Export commands: push_scheduler script --plan-file {} --shell bash|powershell",
+        plan.plan_file.display()
+    );
+}
+
+fn render_bash_script(plan: &Plan) -> AppResult<String> {
+    let last_commit = plan
+        .commits
+        .last()
+        .ok_or_else(|| "plan file contains no commits".to_string())?;
+    let mut out = String::new();
+
+    writeln!(out, "#!/usr/bin/env bash").unwrap();
+    writeln!(out, "set -euo pipefail").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "REPO={}", bash_quote(&plan.repo_path)).unwrap();
+    writeln!(out, "BRANCH={}", bash_quote(&plan.branch)).unwrap();
+    writeln!(out, "REMOTE={}", bash_quote(&plan.remote)).unwrap();
+    writeln!(out, "REMOTE_BRANCH={}", bash_quote(&plan.remote_branch)).unwrap();
+    writeln!(out, "BASE_SHA={}", bash_quote(&plan.base_sha)).unwrap();
+    writeln!(out, "EXPECTED_HEAD={}", bash_quote(&last_commit.sha)).unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "cd \"$REPO\"").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "current_branch=$(git branch --show-current)").unwrap();
+    writeln!(out, "if [[ \"$current_branch\" != \"$BRANCH\" ]]; then").unwrap();
+    writeln!(out, "  echo \"error: current branch '$current_branch' != expected '$BRANCH'\" >&2").unwrap();
+    writeln!(out, "  exit 1").unwrap();
+    writeln!(out, "fi").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "head_sha=$(git rev-parse HEAD)").unwrap();
+    writeln!(out, "if [[ \"$head_sha\" != \"$EXPECTED_HEAD\" ]]; then").unwrap();
+    writeln!(out, "  echo \"error: HEAD $head_sha != expected $EXPECTED_HEAD; local history changed\" >&2").unwrap();
+    writeln!(out, "  exit 1").unwrap();
+    writeln!(out, "fi").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "check_remote_sha() {{").unwrap();
+    writeln!(out, "  local expected=\"$1\"").unwrap();
+    writeln!(out, "  local found").unwrap();
+    writeln!(out, "  found=$(git ls-remote --heads \"$REMOTE\" \"refs/heads/$REMOTE_BRANCH\" | awk 'NR==1 {{print $1}}')").unwrap();
+    writeln!(out, "  if [[ -z \"$found\" ]]; then").unwrap();
+    writeln!(out, "    echo \"error: failed to resolve remote branch head for $REMOTE/$REMOTE_BRANCH\" >&2").unwrap();
+    writeln!(out, "    exit 1").unwrap();
+    writeln!(out, "  fi").unwrap();
+    writeln!(out, "  if [[ \"$found\" != \"$expected\" ]]; then").unwrap();
+    writeln!(out, "    echo \"error: remote drifted; expected $expected found $found\" >&2").unwrap();
+    writeln!(out, "    exit 1").unwrap();
+    writeln!(out, "  fi").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    let mut expected_remote_sha = plan.base_sha.clone();
+    for (index, commit) in plan.commits.iter().enumerate() {
+        writeln!(out, "# Push {} of {}: {} {}", index + 1, plan.commits.len(), short_sha(&commit.sha), commit.subject).unwrap();
+        if index > 0 && commit.delay_seconds > 0 {
+            writeln!(out, "sleep {}", commit.delay_seconds).unwrap();
+        }
+        writeln!(out, "check_remote_sha {}", bash_quote(&expected_remote_sha)).unwrap();
+        writeln!(
+            out,
+            "git push \"$REMOTE\" {}:\"refs/heads/$REMOTE_BRANCH\"",
+            bash_quote(&commit.sha)
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+        expected_remote_sha = commit.sha.clone();
+    }
+
+    Ok(out)
+}
+
+fn render_powershell_script(plan: &Plan) -> AppResult<String> {
+    let last_commit = plan
+        .commits
+        .last()
+        .ok_or_else(|| "plan file contains no commits".to_string())?;
+    let mut out = String::new();
+
+    writeln!(out, "$ErrorActionPreference = 'Stop'").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "$Repo = {}", powershell_quote(&plan.repo_path)).unwrap();
+    writeln!(out, "$Branch = {}", powershell_quote(&plan.branch)).unwrap();
+    writeln!(out, "$Remote = {}", powershell_quote(&plan.remote)).unwrap();
+    writeln!(out, "$RemoteBranch = {}", powershell_quote(&plan.remote_branch)).unwrap();
+    writeln!(out, "$BaseSha = {}", powershell_quote(&plan.base_sha)).unwrap();
+    writeln!(out, "$ExpectedHead = {}", powershell_quote(&last_commit.sha)).unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "Set-Location -Path $Repo").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "$currentBranch = (git branch --show-current).Trim()").unwrap();
+    writeln!(out, "if ($currentBranch -ne $Branch) {{").unwrap();
+    writeln!(out, "    throw \"current branch '$currentBranch' != expected '$Branch'\"").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "$headSha = (git rev-parse HEAD).Trim()").unwrap();
+    writeln!(out, "if ($headSha -ne $ExpectedHead) {{").unwrap();
+    writeln!(out, "    throw \"HEAD $headSha != expected $ExpectedHead; local history changed\"").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "function Check-RemoteSha([string]$Expected) {{").unwrap();
+    writeln!(out, "    $remoteRef = \"refs/heads/$RemoteBranch\"").unwrap();
+    writeln!(out, "    $line = git ls-remote --heads $Remote $remoteRef | Select-Object -First 1").unwrap();
+    writeln!(out, "    if (-not $line) {{").unwrap();
+    writeln!(out, "        throw \"failed to resolve remote branch head for $Remote/$RemoteBranch\"").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    $found = ($line -split '\\s+')[0]").unwrap();
+    writeln!(out, "    if ($found -ne $Expected) {{").unwrap();
+    writeln!(out, "        throw \"remote drifted; expected $Expected found $found\"").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    let mut expected_remote_sha = plan.base_sha.clone();
+    for (index, commit) in plan.commits.iter().enumerate() {
+        writeln!(out, "# Push {} of {}: {} {}", index + 1, plan.commits.len(), short_sha(&commit.sha), commit.subject).unwrap();
+        if index > 0 && commit.delay_seconds > 0 {
+            writeln!(out, "Start-Sleep -Seconds {}", commit.delay_seconds).unwrap();
+        }
+        writeln!(out, "Check-RemoteSha {}", powershell_quote(&expected_remote_sha)).unwrap();
+        writeln!(
+            out,
+            "git push $Remote {}:\"refs/heads/$RemoteBranch\"",
+            powershell_quote(&commit.sha)
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+        expected_remote_sha = commit.sha.clone();
+    }
+
+    Ok(out)
+}
+
+fn bash_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn remote_head_sha(repo_path: &Path, remote: &str, remote_branch: &str) -> AppResult<String> {
@@ -994,7 +1224,10 @@ impl XorShift64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_marker, escape_field, format_duration, normalize_marker_text, split_escaped_fields};
+    use super::{
+        bash_quote, contains_marker, escape_field, format_duration, normalize_marker_text,
+        powershell_quote, split_escaped_fields,
+    };
 
     #[test]
     fn escapes_round_trip() {
@@ -1011,6 +1244,16 @@ mod tests {
             .join("\t");
         let decoded = split_escaped_fields(&encoded).expect("decode");
         assert_eq!(decoded, fields);
+    }
+
+    #[test]
+    fn bash_quote_escapes_single_quotes() {
+        assert_eq!(bash_quote("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    fn powershell_quote_escapes_single_quotes() {
+        assert_eq!(powershell_quote("a'b"), "'a''b'");
     }
 
     #[test]
