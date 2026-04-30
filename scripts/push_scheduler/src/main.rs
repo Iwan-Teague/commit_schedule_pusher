@@ -5,6 +5,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +19,7 @@ const DEFAULT_MIN_DELAY_SECONDS: u64 = 720;
 const DEFAULT_MAX_DELAY_SECONDS: u64 = 5400;
 const NETWORK_RETRY_ATTEMPTS: u32 = 5;
 const NETWORK_RETRY_BASE_DELAY_SECONDS: u64 = 2;
+const DAEMON_POLL_INTERVAL_SECONDS: u64 = 30;
 
 fn main() {
     if let Err(error) = run() {
@@ -37,6 +39,8 @@ fn run() -> AppResult<()> {
         Mode::Script(args) => render_script(args)?,
         Mode::Account(args) => cmd_account(args)?,
         Mode::Split(args) => cmd_split(args)?,
+        Mode::Daemon(args) => cmd_daemon(args)?,
+        Mode::DaemonInstall(args) => cmd_daemon_install(args)?,
     }
     Ok(())
 }
@@ -49,6 +53,8 @@ enum Mode {
     Script(ScriptArgs),
     Account(AccountArgs),
     Split(SplitArgs),
+    Daemon(DaemonArgs),
+    DaemonInstall(DaemonInstallArgs),
 }
 
 struct PlanArgs {
@@ -83,6 +89,15 @@ struct SplitArgs {
 
 struct AccountArgs {
     action: AccountAction,
+}
+
+struct DaemonArgs {
+    dir: PathBuf,
+    poll_interval_seconds: u64,
+}
+
+struct DaemonInstallArgs {
+    dir: Option<PathBuf>,
 }
 
 enum AccountAction {
@@ -184,6 +199,8 @@ fn parse_cli(args: Vec<String>) -> AppResult<Mode> {
         "script" => parse_script_args(&args[2..]).map(Mode::Script),
         "account" => parse_account_args(&args[2..]).map(Mode::Account),
         "split" => parse_split_args(&args[2..]).map(Mode::Split),
+        "daemon" => parse_daemon_args(&args[2..]).map(Mode::Daemon),
+        "daemon-install" => parse_daemon_install_args(&args[2..]).map(Mode::DaemonInstall),
         "--help" | "-h" | "help" => Err(usage()),
         other => Err(format!("unknown subcommand '{other}'\n\n{}", usage())),
     }
@@ -355,6 +372,41 @@ fn parse_account_args(args: &[String]) -> AppResult<AccountArgs> {
     Ok(AccountArgs { action })
 }
 
+fn parse_daemon_args(args: &[String]) -> AppResult<DaemonArgs> {
+    let default_dir = default_config_dir();
+    let mut dir = default_dir;
+    let mut poll_interval_seconds = DAEMON_POLL_INTERVAL_SECONDS;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => { i += 1; dir = PathBuf::from(args.get(i).ok_or("--dir requires a path")?); }
+            "--poll-interval-seconds" => { i += 1; poll_interval_seconds = parse_u64(args.get(i), "--poll-interval-seconds")?; }
+            "--help" | "-h" => return Err(usage()),
+            other => return Err(format!("unknown daemon option '{other}'\n\n{}", usage())),
+        }
+        i += 1;
+    }
+
+    Ok(DaemonArgs { dir, poll_interval_seconds })
+}
+
+fn parse_daemon_install_args(args: &[String]) -> AppResult<DaemonInstallArgs> {
+    let mut dir = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => { i += 1; dir = Some(PathBuf::from(args.get(i).ok_or("--dir requires a path")?)); }
+            "--help" | "-h" => return Err(usage()),
+            other => return Err(format!("unknown daemon-install option '{other}'\n\n{}", usage())),
+        }
+        i += 1;
+    }
+
+    Ok(DaemonInstallArgs { dir })
+}
+
 fn parse_shell(value: Option<&String>) -> AppResult<ScriptShell> {
     match value.ok_or("--shell requires a value: bash or powershell")?.to_ascii_lowercase().as_str() {
         "bash" | "sh" => Ok(ScriptShell::Bash),
@@ -374,11 +426,15 @@ fn usage() -> String {
          push_scheduler account add --name NAME --username USER --email EMAIL --token TOKEN\n\
          push_scheduler account list\n\
          push_scheduler account remove --name NAME\n\
-         push_scheduler account verify --name NAME [--repo PATH]\n\n\
+         push_scheduler account verify --name NAME [--repo PATH]\n\
+         push_scheduler daemon [--dir PATH] [--poll-interval-seconds N]\n\
+         push_scheduler daemon-install [--dir PATH]\n\n\
          Defaults:\n\
            plan file:          {DEFAULT_PLAN_FILE}\n\
            min delay seconds:  {DEFAULT_MIN_DELAY_SECONDS} ({}m)\n\
-           max delay seconds:  {DEFAULT_MAX_DELAY_SECONDS} ({}m)",
+           max delay seconds:  {DEFAULT_MAX_DELAY_SECONDS} ({}m)\n\
+           daemon poll:        {DAEMON_POLL_INTERVAL_SECONDS}s\n\
+           daemon dir:         ~/.config/push_scheduler",
         DEFAULT_MIN_DELAY_SECONDS / 60,
         DEFAULT_MAX_DELAY_SECONDS / 60,
     )
@@ -389,6 +445,13 @@ fn parse_u64(value: Option<&String>, flag_name: &str) -> AppResult<u64> {
         .ok_or_else(|| format!("{flag_name} requires a numeric value"))?
         .parse::<u64>()
         .map_err(|_| format!("{flag_name} requires a numeric value"))
+}
+
+fn default_config_dir() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".config").join("push_scheduler")
 }
 
 // ─── plan command ─────────────────────────────────────────────────────────────
@@ -503,8 +566,12 @@ fn execute_plan(args: ExecuteArgs) -> AppResult<()> {
 
     let plan = read_plan_file(&args.plan_file)?;
     let repo_path = canonical_repo_path(Path::new(&plan.repo_path))?;
+    validate_local_state(&plan, &repo_path)?;
+    run_plan_core(&plan, &repo_path, args.token_override.as_deref())
+}
 
-    let current_branch = git(&repo_path, &["branch", "--show-current"])?;
+fn validate_local_state(plan: &Plan, repo_path: &Path) -> AppResult<()> {
+    let current_branch = git(repo_path, &["branch", "--show-current"])?;
     if current_branch != plan.branch {
         return Err(format!(
             "current branch is '{}' but the saved plan targets '{}'; re-plan or switch back first",
@@ -514,7 +581,7 @@ fn execute_plan(args: ExecuteArgs) -> AppResult<()> {
 
     let last_commit = plan.commits.last()
         .ok_or_else(|| "plan file contains no commits".to_string())?;
-    let head_sha = git(&repo_path, &["rev-parse", "HEAD"])?;
+    let head_sha = git(repo_path, &["rev-parse", "HEAD"])?;
     if head_sha != last_commit.sha {
         return Err(format!(
             "HEAD is {} but the saved plan expected {}; local history changed, re-plan",
@@ -522,13 +589,15 @@ fn execute_plan(args: ExecuteArgs) -> AppResult<()> {
         ));
     }
 
-    // Resolve push account
-    let account = resolve_push_account(&plan, args.token_override.as_deref())?;
+    Ok(())
+}
+
+fn run_plan_core(plan: &Plan, repo_path: &Path, token_override: Option<&str>) -> AppResult<()> {
+    let account = resolve_push_account(plan, token_override)?;
     if let Some(ref acc) = account {
         println!("Pushing as account '{}' ({})", acc.name, acc.github_username);
-        // Quick-fail verify before we start sleeping
         let auth_url = build_authenticated_url(&plan.remote_url, &acc.github_username, &acc.token)?;
-        quick_verify_remote(&repo_path, &auth_url, &acc.name, &acc.token)?;
+        quick_verify_remote(repo_path, &auth_url, &acc.name, &acc.token)?;
     }
 
     // Verify remote state hasn't drifted
@@ -538,13 +607,13 @@ fn execute_plan(args: ExecuteArgs) -> AppResult<()> {
         .transpose()?;
     let fetch_target = fetch_url.as_deref().unwrap_or(&plan.remote);
     git_with_retry(
-        &repo_path,
+        repo_path,
         &["fetch", "--quiet", fetch_target, &fetch_refspec],
         "fetch remote branch state",
     )?;
 
     let remote_tracking_ref = format!("refs/remotes/{}/{}", plan.remote, plan.remote_branch);
-    let fetched_remote_sha = git(&repo_path, &["rev-parse", &remote_tracking_ref])?;
+    let fetched_remote_sha = git(repo_path, &["rev-parse", &remote_tracking_ref])?;
     if fetched_remote_sha != plan.base_sha {
         return Err(format!(
             "remote branch moved from {} to {} since plan was created; re-plan before pushing",
@@ -582,9 +651,9 @@ fn execute_plan(args: ExecuteArgs) -> AppResult<()> {
 
         let remote_sha = if let Some(ref acc) = account {
             let auth_url = build_authenticated_url(&plan.remote_url, &acc.github_username, &acc.token)?;
-            remote_head_sha_auth_with_retry(&repo_path, &auth_url, &plan.remote_branch, &acc.token)?
+            remote_head_sha_auth_with_retry(repo_path, &auth_url, &plan.remote_branch, &acc.token)?
         } else {
-            remote_head_sha_with_retry(&repo_path, &plan.remote, &plan.remote_branch)?
+            remote_head_sha_with_retry(repo_path, &plan.remote, &plan.remote_branch)?
         };
 
         if remote_sha != *expected_remote_sha {
@@ -606,7 +675,7 @@ fn execute_plan(args: ExecuteArgs) -> AppResult<()> {
         if let Some(ref acc) = account {
             let auth_url = build_authenticated_url(&plan.remote_url, &acc.github_username, &acc.token)?;
             git_with_retry_env(
-                &repo_path,
+                repo_path,
                 &["push", &auth_url, &push_refspec],
                 "push commit",
                 &[("GIT_TERMINAL_PROMPT", "0")],
@@ -614,7 +683,7 @@ fn execute_plan(args: ExecuteArgs) -> AppResult<()> {
             )?;
         } else {
             git_with_retry(
-                &repo_path,
+                repo_path,
                 &["push", &plan.remote, &push_refspec],
                 "push commit",
             )?;
@@ -667,6 +736,201 @@ fn execute_background(args: &ExecuteArgs) -> AppResult<()> {
     println!("  Log:     {}", log_path.display());
     println!("  Monitor: tail -f {}", log_path.display());
     println!("  Stop:    kill {pid}");
+    Ok(())
+}
+
+// ─── daemon command ───────────────────────────────────────────────────────────
+
+fn cmd_daemon(args: DaemonArgs) -> AppResult<()> {
+    let pending_dir = args.dir.join("pending");
+    let running_dir = args.dir.join("running");
+    let done_dir    = args.dir.join("done");
+    let failed_dir  = args.dir.join("failed");
+
+    for dir in [&pending_dir, &running_dir, &done_dir, &failed_dir] {
+        fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+
+    // Crash recovery: anything left in running/ didn't finish — move back to pending/
+    for entry in fs::read_dir(&running_dir)
+        .map_err(|e| format!("cannot read running dir: {e}"))? {
+        let path = entry.map_err(|e| format!("dir entry error: {e}"))?.path();
+        if path.extension().map_or(false, |e| e == "plan") {
+            let dest = pending_dir.join(path.file_name().unwrap());
+            if let Err(e) = fs::rename(&path, &dest) {
+                daemon_log(&format!("warn: cannot recover {}: {e}", path.display()));
+            } else {
+                daemon_log(&format!("recovered interrupted plan: {}", path.file_name().unwrap().to_string_lossy()));
+            }
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<(PathBuf, AppResult<()>)>();
+
+    daemon_log(&format!(
+        "daemon started — watching {} every {}s",
+        pending_dir.display(), args.poll_interval_seconds
+    ));
+
+    loop {
+        // Collect completions from finished threads
+        while let Ok((running_file, result)) = rx.try_recv() {
+            let stem = running_file
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let ts = now_epoch_seconds().unwrap_or(0);
+            match result {
+                Ok(()) => {
+                    let dest = done_dir.join(format!("{stem}_{ts}.plan"));
+                    let _ = fs::rename(&running_file, &dest);
+                    daemon_log(&format!("done: {stem}"));
+                }
+                Err(e) => {
+                    let dest = failed_dir.join(format!("{stem}_{ts}.plan"));
+                    let _ = fs::rename(&running_file, &dest);
+                    daemon_log(&format!("failed: {stem}: {e}"));
+                }
+            }
+        }
+
+        // Scan pending/ and pick up any new plan files
+        let pending_files: Vec<PathBuf> = match fs::read_dir(&pending_dir) {
+            Ok(entries) => entries
+                .filter_map(|e| {
+                    let path = e.ok()?.path();
+                    if path.extension()?.to_str()? == "plan" { Some(path) } else { None }
+                })
+                .collect(),
+            Err(e) => {
+                daemon_log(&format!("warn: cannot scan pending dir: {e}"));
+                vec![]
+            }
+        };
+
+        for plan_path in pending_files {
+            let file_name = match plan_path.file_name() {
+                Some(n) => n.to_owned(),
+                None => continue,
+            };
+            let running_path = running_dir.join(&file_name);
+
+            // Atomic claim: rename pending → running. Fails if another daemon instance raced us.
+            if let Err(e) = fs::rename(&plan_path, &running_path) {
+                daemon_log(&format!("warn: cannot claim {}: {e}", file_name.to_string_lossy()));
+                continue;
+            }
+
+            daemon_log(&format!("starting: {}", file_name.to_string_lossy()));
+
+            let tx2 = tx.clone();
+            let rp  = running_path.clone();
+            thread::spawn(move || {
+                let result = run_plan_from_file(&rp);
+                tx2.send((rp, result)).ok();
+            });
+        }
+
+        thread::sleep(Duration::from_secs(args.poll_interval_seconds));
+    }
+}
+
+fn run_plan_from_file(plan_file: &Path) -> AppResult<()> {
+    let plan = read_plan_file(plan_file)?;
+    let repo_path = canonical_repo_path(Path::new(&plan.repo_path))?;
+    validate_local_state(&plan, &repo_path)?;
+    run_plan_core(&plan, &repo_path, None)
+}
+
+fn daemon_log(msg: &str) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("[{ts}] {msg}");
+}
+
+// ─── daemon-install command ───────────────────────────────────────────────────
+
+fn cmd_daemon_install(args: DaemonInstallArgs) -> AppResult<()> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot locate current executable: {e}"))?;
+
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| "HOME environment variable is not set".to_string())?;
+
+    let dir = args.dir.unwrap_or_else(|| default_config_dir());
+
+    let log_file = PathBuf::from(&home)
+        .join("Library").join("Logs").join("push_scheduler_daemon.log");
+
+    let plist_dir = PathBuf::from(&home).join("Library").join("LaunchAgents");
+    fs::create_dir_all(&plist_dir)
+        .map_err(|e| format!("cannot create LaunchAgents directory: {e}"))?;
+
+    let plist_path = plist_dir.join("com.push-scheduler.daemon.plist");
+
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \t<key>Label</key>\n\
+         \t<string>com.push-scheduler.daemon</string>\n\
+         \t<key>ProgramArguments</key>\n\
+         \t<array>\n\
+         \t\t<string>{exe}</string>\n\
+         \t\t<string>daemon</string>\n\
+         \t\t<string>--dir</string>\n\
+         \t\t<string>{dir}</string>\n\
+         \t</array>\n\
+         \t<key>RunAtLoad</key>\n\
+         \t<true/>\n\
+         \t<key>KeepAlive</key>\n\
+         \t<true/>\n\
+         \t<key>StandardOutPath</key>\n\
+         \t<string>{log}</string>\n\
+         \t<key>StandardErrorPath</key>\n\
+         \t<string>{log}</string>\n\
+         </dict>\n\
+         </plist>\n",
+        exe = exe.display(),
+        dir = dir.display(),
+        log = log_file.display(),
+    );
+
+    fs::write(&plist_path, &plist)
+        .map_err(|e| format!("cannot write plist to {}: {e}", plist_path.display()))?;
+
+    // Unload any previous instance (ignore errors — may not be loaded yet)
+    let _ = Command::new("launchctl")
+        .args(["unload", &plist_path.to_string_lossy()])
+        .output();
+
+    let load_output = Command::new("launchctl")
+        .args(["load", &plist_path.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("launchctl not found: {e}"))?;
+
+    if !load_output.status.success() {
+        let stderr = String::from_utf8_lossy(&load_output.stderr).trim().to_string();
+        return Err(format!("launchctl load failed: {stderr}"));
+    }
+
+    println!("Daemon installed and started via launchd.");
+    println!("  Plist:    {}", plist_path.display());
+    println!("  Drop dir: {}/pending/", dir.display());
+    println!("  Log:      {}", log_file.display());
+    println!("  Monitor:  tail -f {}", log_file.display());
+    println!("  Stop:     launchctl unload {}", plist_path.display());
+    println!("  Restart:  launchctl unload {path} && launchctl load {path}",
+             path = plist_path.display());
+    println!("\nAgent workflow: push_scheduler plan --repo PATH --plan-file {}/pending/job.plan",
+             dir.display());
+
     Ok(())
 }
 
@@ -990,7 +1254,7 @@ fn resolve_push_account(plan: &Plan, token_override: Option<&str>) -> AppResult<
 
     Err(format!(
         "plan requires GitHub account '{}' but no matching stored account found.\n\
-         Pass --token TOKEN or run: push_scheduler account add --name NAME --username {} ...",
+         Run: push_scheduler account add --name NAME --username {} ...",
         plan.github_username, plan.github_username
     ))
 }
@@ -1443,6 +1707,8 @@ fn print_plan_summary(plan: &Plan) {
     } else {
         println!("  push_scheduler execute --plan-file {} --yes --background --token YOUR_TOKEN", plan.plan_file.display());
     }
+    println!("\nRun via daemon (drop plan in pending dir):");
+    println!("  cp {} ~/.config/push_scheduler/pending/", plan.plan_file.display());
 }
 
 fn render_bash_script(plan: &Plan) -> AppResult<String> {
@@ -1589,7 +1855,7 @@ fn render_powershell_script(plan: &Plan) -> AppResult<String> {
     Ok(out)
 }
 
-// ─── git helpers ──────────────────────────────────────────────────────────────
+// ─── formatting helpers ───────────────────────────────────────────────────────
 
 fn bash_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
