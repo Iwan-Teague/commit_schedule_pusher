@@ -55,6 +55,98 @@ Crash recovery: on startup the daemon moves any files left in `running/` back to
 
 ---
 
+## macOS Keychain — One-Time Setup (Fix "Always Allow" prompt)
+
+When the daemon pushes in the background, macOS may show a keychain dialog:
+> "git-credential-osxkeychain wants to use your confidential information stored in github.com"
+
+**Fix: click "Always Allow"** (not just "Allow") the next time it appears and enter your Mac login password. macOS will never prompt again for that keychain entry.
+
+If the daemon is unattended and you can't click the dialog, switch to a credential store that never prompts:
+
+```bash
+git config --global credential.helper store
+# Then do one manual push — enters username+token once, writes to ~/.git-credentials
+```
+
+After either fix, the daemon runs fully silent with no dialogs.
+
+---
+
+## MANDATORY: Confirm Before Any Action
+
+**Before running ANY command, present the filled confirmation table to the user and wait for explicit "yes" / approval.**
+
+### Step 0 — Auto-detect repo state (always run this first)
+
+Run these commands immediately when the skill is invoked, before asking the user anything:
+
+```bash
+git -C <repo> log --oneline --not --remotes 2>/dev/null || git -C <repo> log --oneline   # unpushed commits (fallback for repos with no remote refs)
+git -C <repo> diff --stat HEAD                 # uncommitted changes
+git -C <repo> remote get-url origin 2>/dev/null || echo "(no remote)"  # remote URL
+git -C <repo> rev-parse --abbrev-ref HEAD      # current branch
+git -C <repo> config user.name
+git -C <repo> config user.email
+```
+
+**Fresh-repo detection:** if `git log --not --remotes` returns all local commits (no remote refs exist) and there is no tracked upstream, this is a **fresh push**. The binary handles this automatically — do not manually create fake tracking refs or seed commits. Just proceed; `base_sha` in the plan will be the null SHA and the remote branch will be created by the first push.
+
+Use the output to fill every field in the table below. Apply these defaults for any field the user has not specified:
+
+| Field | Default if not specified |
+|---|---|
+| Commits to push | All unpushed commits found by `git log --not --remotes` |
+| Split uncommitted changes | Yes, if `git diff --stat HEAD` is non-empty; No otherwise |
+| Split count | 3–5 based on total changed-line count |
+| Min delay | 10 min |
+| Max delay | 40 min |
+| First push delay | 0 s |
+| GitHub account | `git config user.name` + `git config user.email` |
+| Execution method | daemon if installed, else background |
+
+**Never leave a field blank or as a placeholder.** If a value truly cannot be determined (e.g. remote URL not set), fill it with `⚠ unknown — please specify` so the user knows to correct it.
+
+### Confirmation table
+
+Present this table, fully filled with real values, every time the skill runs:
+
+```
+📋 Push Schedule — Please Confirm
+
+  Repo path        : /path/to/repo
+  Remote URL       : https://github.com/owner/repo
+  Branch           : main → origin/main
+
+  Uncommitted changes : yes (will split into N commits) / no
+  Commits to push  :
+    abc1234  feat: add login page
+    def5678  fix: correct header styles
+    ...
+
+  Commit author    : First Last <email@example.com>
+                     ⚠ confirm — no Claude/AI attribution allowed
+
+  Schedule
+    Delay before first push : 0 s
+    Min delay between pushes: 10 min
+    Max delay between pushes: 40 min
+    Total window (estimated): ~X hours
+
+  GitHub account   : username / default git credentials
+  Execution method : daemon / background / script
+
+  Run command (manual fallback):
+    bash /tmp/push.sh
+```
+
+**The "Run command" field must always appear in the confirmation table.** The script will be generated at `/tmp/push.sh` after approval — show the path now so the user knows where to find it. This is critical: it is the user's manual override if the daemon stalls.
+
+**Do not proceed until the user confirms or corrects this table.**
+Reply "yes", "looks good", or similar to approve. Any correction → update the table and re-show before proceeding.
+
+---
+
 ## Typical Workflow (with daemon)
 
 ### 1 — Split uncommitted changes into commits (optional)
@@ -84,14 +176,9 @@ Saving the plan directly to `pending/` is enough — the daemon picks it up with
 
 ### 3 — Confirm with the user
 
-Show the printed schedule. Always include:
-- Branch and tracked upstream
-- Author/committer identities in the pending commits
-- Per-commit delay and cumulative push time
-- GitHub username and email if an account is configured
-- Total runtime
+Present the **mandatory confirmation table** above (if not already shown). Wait for explicit approval. Do not write any plan file until the user says yes.
 
-Wait for explicit approval before writing the plan file to `pending/`.
+After the plan runs, always generate a standalone bash script (Step 4a) and show the user the command to run it themselves, even if they chose daemon execution.
 
 ---
 
@@ -99,7 +186,9 @@ Wait for explicit approval before writing the plan file to `pending/`.
 
 ### Steps 1–3 as above, then:
 
-### 4a — Generate a copy-paste script
+### 4a — Generate a copy-paste script (ALWAYS DO THIS)
+
+Always generate the script regardless of execution method chosen. This gives the user a fallback they can run manually.
 
 ```bash
 /tmp/git-push-scheduler-target/release/push_scheduler \
@@ -109,11 +198,19 @@ Wait for explicit approval before writing the plan file to `pending/`.
   --output /tmp/push.sh
 ```
 
-Return the script to the user in a fenced code block. If an account is configured the script requires:
-```bash
-export PUSH_SCHEDULER_TOKEN='ghp_...'
-bash /tmp/push.sh
+**Always output the run command to the user**, even when using the daemon:
+
 ```
+✅ Script saved. To run it yourself at any time:
+
+    bash /tmp/push.sh
+
+(If using a GitHub account token)
+    export PUSH_SCHEDULER_TOKEN='ghp_...'
+    bash /tmp/push.sh
+```
+
+Show this block at the end of every skill run — it is the user's manual override if the daemon is unavailable.
 
 ### 4b — Execute directly (background)
 
@@ -234,6 +331,7 @@ Score = insertions + deletions + (files_changed × 12) + (binary_files × 30)
 | No pending commits | `plan` fails with clear message |
 | No uncommitted changes | `split` fails with clear message |
 | Daemon crash mid-plan | Plan moved from running/ back to pending/ on next startup |
+| Fresh repo / no upstream | `plan` detects missing upstream and uses null SHA as base; remote branch created by first push — **do not manually create fake tracking refs** |
 
 ---
 

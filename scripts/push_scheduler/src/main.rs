@@ -20,6 +20,8 @@ const DEFAULT_MAX_DELAY_SECONDS: u64 = 5400;
 const NETWORK_RETRY_ATTEMPTS: u32 = 5;
 const NETWORK_RETRY_BASE_DELAY_SECONDS: u64 = 2;
 const DAEMON_POLL_INTERVAL_SECONDS: u64 = 30;
+// Sentinel base SHA for fresh repos where the remote branch does not yet exist.
+const EMPTY_SHA: &str = "0000000000000000000000000000000000000000";
 
 fn main() {
     if let Err(error) = run() {
@@ -460,14 +462,38 @@ fn build_plan(args: PlanArgs) -> AppResult<Plan> {
     let repo_path = canonical_repo_path(&args.repo)?;
     let branch = git(&repo_path, &["branch", "--show-current"])?;
     if branch.is_empty() {
-        return Err("HEAD is detached; switch to a branch with a tracked upstream first".to_string());
+        return Err("HEAD is detached; switch to a named branch before planning".to_string());
     }
 
-    let upstream = upstream_info(&repo_path, &branch)?;
-    let base_sha = git(&repo_path, &["rev-parse", "@{upstream}"])?;
+    // Try to find a configured upstream; fall back to inferring remote for fresh repos.
+    let (upstream, base_sha) = match upstream_info(&repo_path, &branch) {
+        Ok(info) => {
+            let sha = git(&repo_path, &["rev-parse", "@{upstream}"])?;
+            (info, sha)
+        }
+        Err(_) => {
+            let remote = infer_remote(&repo_path)?;
+            let remote_ref = format!("refs/heads/{branch}");
+            let upstream_short = format!("{remote}/{branch}");
+            let info = UpstreamInfo {
+                short_name: upstream_short,
+                remote,
+                remote_ref,
+                remote_branch: branch.clone(),
+            };
+            (info, EMPTY_SHA.to_string())
+        }
+    };
+
     let remote_url = git(&repo_path, &["remote", "get-url", &upstream.remote]).unwrap_or_default();
 
-    let rev_list = git(&repo_path, &["rev-list", "--reverse", "@{upstream}..HEAD"])?;
+    let rev_list = if base_sha == EMPTY_SHA {
+        // Fresh repo — include all commits from the very first one.
+        git(&repo_path, &["rev-list", "--reverse", "HEAD"])?
+    } else {
+        git(&repo_path, &["rev-list", "--reverse", "@{upstream}..HEAD"])?
+    };
+
     let pending_shas: Vec<String> = rev_list.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -475,7 +501,15 @@ fn build_plan(args: PlanArgs) -> AppResult<Plan> {
         .collect();
 
     if pending_shas.is_empty() {
+        if base_sha == EMPTY_SHA {
+            return Err("no commits in repository; create at least one commit before planning".to_string());
+        }
         return Err("no commits are ahead of the tracked upstream branch".to_string());
+    }
+
+    if base_sha == EMPTY_SHA {
+        eprintln!("note: remote branch '{}/{}' does not exist yet — will be created on first push",
+            upstream.remote, upstream.remote_branch);
     }
 
     let mut commits = Vec::with_capacity(pending_shas.len());
@@ -600,25 +634,29 @@ fn run_plan_core(plan: &Plan, repo_path: &Path, token_override: Option<&str>) ->
         quick_verify_remote(repo_path, &auth_url, &acc.name, &acc.token)?;
     }
 
-    // Verify remote state hasn't drifted
-    let fetch_refspec = format!("{}:refs/remotes/{}/{}", plan.remote_ref, plan.remote, plan.remote_branch);
-    let fetch_url = account.as_ref()
-        .map(|a| build_authenticated_url(&plan.remote_url, &a.github_username, &a.token))
-        .transpose()?;
-    let fetch_target = fetch_url.as_deref().unwrap_or(&plan.remote);
-    git_with_retry(
-        repo_path,
-        &["fetch", "--quiet", fetch_target, &fetch_refspec],
-        "fetch remote branch state",
-    )?;
+    // Verify remote state hasn't drifted (skip when remote branch doesn't exist yet)
+    if plan.base_sha != EMPTY_SHA {
+        let fetch_refspec = format!("{}:refs/remotes/{}/{}", plan.remote_ref, plan.remote, plan.remote_branch);
+        let fetch_url = account.as_ref()
+            .map(|a| build_authenticated_url(&plan.remote_url, &a.github_username, &a.token))
+            .transpose()?;
+        let fetch_target = fetch_url.as_deref().unwrap_or(&plan.remote);
+        git_with_retry(
+            repo_path,
+            &["fetch", "--quiet", fetch_target, &fetch_refspec],
+            "fetch remote branch state",
+        )?;
 
-    let remote_tracking_ref = format!("refs/remotes/{}/{}", plan.remote, plan.remote_branch);
-    let fetched_remote_sha = git(repo_path, &["rev-parse", &remote_tracking_ref])?;
-    if fetched_remote_sha != plan.base_sha {
-        return Err(format!(
-            "remote branch moved from {} to {} since plan was created; re-plan before pushing",
-            short_sha(&plan.base_sha), short_sha(&fetched_remote_sha)
-        ));
+        let remote_tracking_ref = format!("refs/remotes/{}/{}", plan.remote, plan.remote_branch);
+        let fetched_remote_sha = git(repo_path, &["rev-parse", &remote_tracking_ref])?;
+        if fetched_remote_sha != plan.base_sha {
+            return Err(format!(
+                "remote branch moved from {} to {} since plan was created; re-plan before pushing",
+                short_sha(&plan.base_sha), short_sha(&fetched_remote_sha)
+            ));
+        }
+    } else {
+        eprintln!("note: fresh push — remote branch will be created by the first push");
     }
 
     println!(
@@ -649,19 +687,22 @@ fn run_plan_core(plan: &Plan, repo_path: &Path, token_override: Option<&str>) ->
             &plan.commits[index - 1].sha
         };
 
-        let remote_sha = if let Some(ref acc) = account {
-            let auth_url = build_authenticated_url(&plan.remote_url, &acc.github_username, &acc.token)?;
-            remote_head_sha_auth_with_retry(repo_path, &auth_url, &plan.remote_branch, &acc.token)?
-        } else {
-            remote_head_sha_with_retry(repo_path, &plan.remote, &plan.remote_branch)?
-        };
+        // Skip drift check when pushing to a branch that doesn't exist on the remote yet.
+        if *expected_remote_sha != EMPTY_SHA {
+            let remote_sha = if let Some(ref acc) = account {
+                let auth_url = build_authenticated_url(&plan.remote_url, &acc.github_username, &acc.token)?;
+                remote_head_sha_auth_with_retry(repo_path, &auth_url, &plan.remote_branch, &acc.token)?
+            } else {
+                remote_head_sha_with_retry(repo_path, &plan.remote, &plan.remote_branch)?
+            };
 
-        if remote_sha != *expected_remote_sha {
-            return Err(format!(
-                "remote branch drifted before push {}/{}: expected {}, found {}; re-plan",
-                index + 1, plan.commits.len(),
-                short_sha(expected_remote_sha), short_sha(&remote_sha)
-            ));
+            if remote_sha != *expected_remote_sha {
+                return Err(format!(
+                    "remote branch drifted before push {}/{}: expected {}, found {}; re-plan",
+                    index + 1, plan.commits.len(),
+                    short_sha(expected_remote_sha), short_sha(&remote_sha)
+                ));
+            }
         }
 
         println!(
@@ -1365,6 +1406,15 @@ fn upstream_info(repo_path: &Path, branch: &str) -> AppResult<UpstreamInfo> {
     Ok(UpstreamInfo { short_name, remote, remote_ref, remote_branch })
 }
 
+fn infer_remote(repo_path: &Path) -> AppResult<String> {
+    let remotes = git(repo_path, &["remote"])?;
+    let first = remotes.lines().map(str::trim).find(|r| !r.is_empty());
+    match first {
+        Some(r) => Ok(r.to_string()),
+        None => Err("no git remote configured; add one with: git remote add origin <url>".to_string()),
+    }
+}
+
 fn collect_commit(repo_path: &Path, sha: &str) -> AppResult<CommitPlan> {
     let metadata = git(repo_path, &["show", "-s", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%s%x1f%B", sha])?;
 
@@ -1662,7 +1712,12 @@ fn print_plan_summary(plan: &Plan) {
         println!("Push account: {} <{}>", plan.github_username, plan.github_email);
     }
     println!("Commits:     {}", plan.commits.len());
-    println!("Base commit: {}", short_sha(&plan.base_sha));
+    if plan.base_sha == EMPTY_SHA {
+        println!("Base commit: (none — fresh push, remote branch '{}/{}' will be created on first push)",
+            plan.remote, plan.remote_branch);
+    } else {
+        println!("Base commit: {}", short_sha(&plan.base_sha));
+    }
     println!("Plan seed:   {}", plan.seed);
     println!("Note: existing commit metadata is preserved; this tool does not rewrite history.");
 
@@ -1763,6 +1818,13 @@ fn render_bash_script(plan: &Plan) -> AppResult<String> {
     writeln!(out, "  local expected=\"$1\"").unwrap();
     writeln!(out, "  local found").unwrap();
     writeln!(out, "  found=$(git ls-remote --heads \"$PUSH_REMOTE\" \"refs/heads/$REMOTE_BRANCH\" | awk 'NR==1 {{print $1}}')").unwrap();
+    writeln!(out, "  if [[ \"$expected\" == \"{}\" ]]; then", EMPTY_SHA).unwrap();
+    writeln!(out, "    # Fresh push — remote branch must not exist yet").unwrap();
+    writeln!(out, "    if [[ -n \"$found\" ]]; then").unwrap();
+    writeln!(out, "      echo \"error: expected no remote branch yet but found $found; re-plan\" >&2; exit 1").unwrap();
+    writeln!(out, "    fi").unwrap();
+    writeln!(out, "    return 0").unwrap();
+    writeln!(out, "  fi").unwrap();
     writeln!(out, "  if [[ -z \"$found\" ]]; then").unwrap();
     writeln!(out, "    echo \"error: cannot resolve remote branch $PUSH_REMOTE/$REMOTE_BRANCH\" >&2; exit 1").unwrap();
     writeln!(out, "  fi").unwrap();
@@ -1832,6 +1894,10 @@ fn render_powershell_script(plan: &Plan) -> AppResult<String> {
     writeln!(out).unwrap();
     writeln!(out, "function Check-RemoteSha([string]$Expected) {{").unwrap();
     writeln!(out, "    $line = git ls-remote --heads $PushRemote \"refs/heads/$RemoteBranch\" | Select-Object -First 1").unwrap();
+    writeln!(out, "    if ($Expected -eq '{}') {{", EMPTY_SHA).unwrap();
+    writeln!(out, "        if ($line) {{ throw \"expected no remote branch yet but found $line; re-plan\" }}").unwrap();
+    writeln!(out, "        return").unwrap();
+    writeln!(out, "    }}").unwrap();
     writeln!(out, "    if (-not $line) {{ throw \"cannot resolve remote branch $PushRemote/$RemoteBranch\" }}").unwrap();
     writeln!(out, "    $found = ($line -split '\\s+')[0]").unwrap();
     writeln!(out, "    if ($found -ne $Expected) {{ throw \"remote drifted; expected $Expected found $found; re-plan\" }}").unwrap();
